@@ -1,7 +1,7 @@
 """
 Facebook Number Checker — Termux / Mobile / HTTP-Only
 =====================================================
-On startup it asks for the numbers.txt path, then runs immediately.
+Auto-detects numbers.txt, runs immediately.
 No browser. No Playwright. Pure HTTP via httpx.
 
 Outputs 4 files next to numbers.txt:
@@ -19,7 +19,9 @@ import re
 import sys
 import time
 import random
+import glob
 from collections import deque
+from pathlib import Path
 
 # ---------- hard dependencies ----------
 try:
@@ -36,13 +38,14 @@ try:
     from rich.live import Live
     from rich.panel import Panel
     from rich.text import Text
+    from rich.table import Table
     HAVE_RICH = True
 except ImportError:
     HAVE_RICH = False
 
 
 # ===================== CONFIG =====================
-DEFAULT_NUMBERS_PATH = "numbers.txt"
+NUMBERS_FILENAME = "numbers.txt"
 
 FILE_EXISTS   = "ACCOUNT_EXISTS.txt"
 FILE_DISABLED = "ACCOUNT_DISABLED.txt"
@@ -52,23 +55,80 @@ FILE_NO       = "NO_ACCOUNT.txt"
 USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Windows Mobile 10; Android 10.0; Microsoft; Lumia 950XL) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 "
     "Edge/40.15254.603 VirusTotalBot",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
     "Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 11; SM-A515F) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36",
 ]
 
 BASE_URL = "https://m.facebook.com"
 IDENTIFY_URL = f"{BASE_URL}/login/identify/"
 
-MAX_ATTEMPTS    = 3
+MAX_ATTEMPTS    = 4          # more retries for accuracy
 REQUEST_TIMEOUT = 15
-PAUSE_BETWEEN   = 0.15
+PAUSE_BETWEEN   = 0.10
 # ==================================================
 
 console = Console() if HAVE_RICH else None
+
+
+# ===================== AUTO-DETECT NUMBERS.TXT =====================
+
+def find_numbers_file():
+    """
+    Search for numbers.txt in common locations:
+    1. Current working directory
+    2. Script directory
+    3. Termux home directory
+    4. /sdcard (if accessible)
+    """
+    candidates = []
+
+    # 1. Current working directory
+    candidates.append(Path.cwd() / NUMBERS_FILENAME)
+
+    # 2. Script's own directory
+    try:
+        candidates.append(Path(__file__).resolve().parent / NUMBERS_FILENAME)
+    except Exception:
+        pass
+
+    # 3. Termux home directory
+    home = Path.home()
+    candidates.append(home / NUMBERS_FILENAME)
+
+    # 4. Common Termux storage paths
+    candidates.append(Path("/sdcard") / NUMBERS_FILENAME)
+    candidates.append(Path("/storage/emulated/0") / NUMBERS_FILENAME)
+
+    # 5. Any .txt file matching *numbers* in cwd
+    for f in glob.glob("*.txt"):
+        if "number" in f.lower() and f != NUMBERS_FILENAME:
+            candidates.append(Path.cwd() / f)
+
+    # Return the first that exists
+    for c in candidates:
+        try:
+            if c.exists() and c.is_file():
+                return str(c)
+        except Exception:
+            continue
+
+    return None
+
+
+def create_sample(path):
+    """Create a sample numbers.txt."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("+1234567890\n+1987654321\n")
+    print(f"[+] Sample created: {path}")
+    print("    Add your numbers and re-run.")
 
 
 # ===================== TERMUX / DEVICE DETECTION =====================
@@ -92,56 +152,18 @@ def detect_workers():
     return 6                                      # generic Linux
 
 
-# ===================== PATH PROMPT =====================
-
-def ask_numbers_path():
-    """
-    Ask the user for the path to numbers.txt.
-    Enter = default ./numbers.txt
-    Also accepts drag-and-drop paths (quotes stripped).
-    """
-    print("=" * 60)
-    print("  Facebook Number Checker — Termux / HTTP mode")
-    print("=" * 60)
-    default_abs = os.path.abspath(DEFAULT_NUMBERS_PATH)
-    try:
-        raw = input(f"Enter path to numbers.txt\n"
-                    f"(press Enter for: {default_abs})\n> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        raw = ""
-
-    if raw == "":
-        return default_abs
-
-    # strip surrounding quotes (drag-and-drop on PC adds them)
-    raw = raw.strip().strip("'").strip('"')
-
-    # expand ~ and env vars
-    raw = os.path.expanduser(os.path.expandvars(raw))
-
-    if not os.path.isabs(raw):
-        raw = os.path.abspath(raw)
-
-    return raw
-
-
 def read_numbers(path):
-    """Read numbers from the given path. Create a sample if missing."""
-    if not os.path.exists(path):
-        print(f"[!] File not found: {path}")
-        try:
-            ans = input("    Create a sample file? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = "n"
-        if ans == "y":
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("+1234567890\n+1987654321\n")
-            print(f"[+] Sample created at {path}. Add numbers and re-run.")
-        return []
-
+    """Read numbers from the given path."""
     with open(path, encoding="utf-8") as f:
-        return [ln.strip() for ln in f if ln.strip()]
+        lines = [ln.strip() for ln in f if ln.strip()]
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for n in lines:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+    return unique
 
 
 # ===================== HTML PARSING =====================
@@ -152,7 +174,6 @@ def extract_form_data(html: str):
 
     form = soup.find("form", id="identify_yourself_flow")
     if not form:
-        # Fallback: any form containing an input named 'email'
         for f in soup.find_all("form"):
             if f.find("input", {"name": "email"}):
                 form = f
@@ -178,42 +199,58 @@ def extract_form_data(html: str):
 
 def classify_response(html: str) -> str:
     """
-    Return one of:
-    ACCOUNT_DISABLED / MULTIPLE_ACCOUNTS / NO_ACCOUNT / ACCOUNT_EXISTS / ERROR
-
-    Uses comprehensive checks on the response HTML for maximum accuracy.
+    Multi-layer classification for maximum accuracy.
+    Returns: ACCOUNT_DISABLED / MULTIPLE_ACCOUNTS / NO_ACCOUNT /
+             ACCOUNT_EXISTS / ERROR
     """
     t = html.lower()
+    soup = BeautifulSoup(html, "html.parser")
 
-    # ---- 1. ACCOUNT DISABLED ----
+    # ===== LAYER 1: DISABLED =====
     if "account has been disabled" in t or "your account has been disabled" in t:
         return "ACCOUNT_DISABLED"
+    for el in soup.find_all(attrs={"data-sigil": "marea"}):
+        if "disabled" in (el.get_text() or "").lower():
+            return "ACCOUNT_DISABLED"
+    # Disabled page often has "Try Again" + "Cancel" buttons
+    if 'id="u_0_0_' in html and "try again" in t and "disabled" in t:
+        return "ACCOUNT_DISABLED"
 
-    # ---- 2. MULTIPLE ACCOUNTS ----
-    # "Choose your account" heading
+    # ===== LAYER 2: MULTIPLE ACCOUNTS =====
+    # Text heading
     if "choose your account" in t:
         return "MULTIPLE_ACCOUNTS"
-    # Mobile form structure: form#login_form with action containing identifier=
-    soup = BeautifulSoup(html, "html.parser")
+    # Structural: form#login_form with identifier= in action
     login_form = soup.find("form", id="login_form")
     if login_form:
         action = login_form.get("action", "") or ""
         if "identifier=" in action:
             return "MULTIPLE_ACCOUNTS"
-    # Also detect account selection links inside data-sigil="marea"
+    # Multiple <a class="touchable primary"> inside data-sigil="marea"
+    account_links = 0
     for area in soup.find_all(attrs={"data-sigil": "marea"}):
-        if area.find("a", class_="touchable"):
-            return "MULTIPLE_ACCOUNTS"
+        for a in area.find_all("a", class_="touchable"):
+            account_links += 1
+    if account_links >= 2:
+        return "MULTIPLE_ACCOUNTS"
+    # Multiple profile image placeholders
+    if html.count('class="img img _1-yc _2sxw"') >= 2:
+        return "MULTIPLE_ACCOUNTS"
 
-    # ---- 3. NO ACCOUNT ----
-    if "login_identify_search_error_msg" in t:
+    # ===== LAYER 3: NO ACCOUNT =====
+    if "login_identify_search_error_msg" in html:
         return "NO_ACCOUNT"
     if "doesn't match an account" in t or "does not match an account" in t:
         return "NO_ACCOUNT"
     if "no account found" in t:
         return "NO_ACCOUNT"
+    # Error div by data-sigil
+    for el in soup.find_all(attrs={"data-sigil": "marea"}):
+        txt = (el.get_text() or "").lower()
+        if "doesn't match" in txt or "no account" in txt:
+            return "NO_ACCOUNT"
 
-    # ---- 4. ACCOUNT EXISTS ----
+    # ===== LAYER 4: ACCOUNT EXISTS =====
     if 'type="password"' in t:
         return "ACCOUNT_EXISTS"
     if "try entering your password" in t:
@@ -222,40 +259,54 @@ def classify_response(html: str) -> str:
         return "ACCOUNT_EXISTS"
     if "enter the code" in t:
         return "ACCOUNT_EXISTS"
-
-    # If the identify form is gone (no more input) -> forwarded = exists
-    if 'id="identify_search_text_input"' not in t and 'name="email"' not in t:
+    # Password input element
+    if soup.find("input", {"type": "password"}):
+        return "ACCOUNT_EXISTS"
+    # Password form with data-testid
+    if soup.find("input", attrs={"data-testid": "conf_password_input"}):
         return "ACCOUNT_EXISTS"
 
-    # ---- Fallback ----
-    # No error element and still on the form -> account exists (user rule)
+    # ===== FALLBACK =====
+    # If identify form is gone -> forwarded
+    if 'id="identify_search_text_input"' not in html and 'name="email"' not in html:
+        return "ACCOUNT_EXISTS"
+    # Still on form, no error element -> assume exists (user rule)
     return "ACCOUNT_EXISTS"
 
 
 # ===================== CORE HTTP CHECK =====================
 
 async def check_number(client: httpx.AsyncClient, number: str) -> str:
+    """
+    Full HTTP flow for one number.
+    Uses a fresh cookie jar each time for consistency.
+    """
     ua = random.choice(USER_AGENTS)
     headers = {
         "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
         "Upgrade-Insecure-Requests": "1",
+        "DNT": "1",
+        "Connection": "keep-alive",
     }
 
-    # GET identify page
+    # --- Step 1: GET identify page (fresh session) ---
     r = await client.get(IDENTIFY_URL, headers=headers, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
 
     action_url, form_data = extract_form_data(r.text)
     if not action_url:
+        # Retry once with a short delay
         await asyncio.sleep(0.5)
-        r = await client.get(IDENTIFY_URL, headers=headers, timeout=REQUEST_TIMEOUT)
+        r = await client.get(IDENTIFY_URL, headers=headers,
+                             timeout=REQUEST_TIMEOUT)
         action_url, form_data = extract_form_data(r.text)
         if not action_url:
             return "ERROR"
 
-    # POST with the number
+    # --- Step 2: POST the number ---
     post_data = dict(form_data)
     post_data["email"] = number
     post_data.setdefault("did_submit", "Search")
@@ -264,10 +315,43 @@ async def check_number(client: httpx.AsyncClient, number: str) -> str:
                            headers=headers, timeout=REQUEST_TIMEOUT)
     r2.raise_for_status()
 
-    return classify_response(r2.text)
+    # --- Step 3: Classify ---
+    result = classify_response(r2.text)
+
+    # --- Step 4: If ambiguous, retry with a FRESH client ---
+    if result == "ERROR":
+        return "ERROR"
+
+    return result
 
 
-# ===================== LIVE UI =====================
+async def check_number_with_retry(number: str) -> str:
+    """
+    Wraps check_number with a fresh httpx client each attempt.
+    This handles cookie/rate-limit inconsistencies.
+    """
+    last_result = "ERROR"
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=REQUEST_TIMEOUT,
+                limits=httpx.Limits(max_connections=4,
+                                    max_keepalive_connections=2),
+            ) as client:
+                result = await check_number(client, number)
+                if result != "ERROR":
+                    return result
+                last_result = result
+        except Exception:
+            pass
+        # Exponential backoff between attempts
+        await asyncio.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.3))
+
+    return last_result
+
+
+# ===================== LIVE UI (RESPONSIVE) =====================
 
 class LiveUI:
     def __init__(self, total, workers):
@@ -286,7 +370,8 @@ class LiveUI:
 
         if HAVE_RICH:
             self.live = Live(self._build(), console=console,
-                             refresh_per_second=4, transient=False)
+                             refresh_per_second=4, transient=False,
+                             vertical_overflow="visible")
 
     def start(self):
         if self.live:
@@ -300,14 +385,23 @@ class LiveUI:
                 pass
 
     def _build(self):
+        """Build a responsive footer that adapts to any terminal width."""
         try:
             term_w = console.size.width
         except Exception:
             term_w = 80
-        bar_w = max(15, min(term_w - 50, 40))
+
+        # ---- Responsive bar width ----
+        # On narrow mobile screens use shorter bar
+        if term_w < 50:
+            bar_w = max(8, term_w - 30)
+        else:
+            bar_w = max(15, min(term_w - 55, 45))
+
         pct = self.done / max(self.total, 1)
         filled = int(bar_w * pct)
         bar = "█" * filled + "░" * (bar_w - filled)
+
         elapsed = time.time() - self.t_start
         rate = self.done / max(elapsed, 0.01)
 
@@ -317,31 +411,49 @@ class LiveUI:
         else:
             eta = "--:--"
 
+        # ---- Build with responsive layout ----
         line1 = Text()
         line1.append("[", style="grey50")
         line1.append(bar, style="bold green")
-        line1.append("] ", style="grey50")
-        line1.append(f"{self.done:>4}/{self.total:<4}", style="bold white")
-        line1.append(f"  {pct*100:5.1f}%", style="bold cyan")
-        line1.append(f"   {rate:5.2f}/s", style="magenta")
-        line1.append(f"   ETA {eta}", style="yellow")
+        line1.append("]", style="grey50")
+        line1.append(f" {self.done}/{self.total}", style="bold white")
+        line1.append(f" {pct*100:.0f}%", style="bold cyan")
+        line1.append(f" {rate:.1f}/s", style="magenta")
+        if term_w >= 50:
+            line1.append(f" ETA {eta}", style="yellow")
 
-        line2 = Text()
-        line2.append("  EXISTS ", style="grey50")
-        line2.append(f"{self.stats['ACCOUNT_EXISTS']:>5}", style="bold green")
-        line2.append("   DISABLED ", style="grey50")
-        line2.append(f"{self.stats['ACCOUNT_DISABLED']:>5}", style="bold yellow")
-        line2.append("   MULTIPLE ", style="grey50")
-        line2.append(f"{self.stats['MULTIPLE_ACCOUNTS']:>5}", style="bold cyan")
-        line2.append("   NO_ACCOUNT ", style="grey50")
-        line2.append(f"{self.stats['NO_ACCOUNT']:>5}", style="bold red")
+        # ---- Category line (stacks on narrow screens) ----
+        if term_w >= 60:
+            # Wide: single line
+            line2 = Text()
+            line2.append("EXISTS ", style="grey50")
+            line2.append(f"{self.stats['ACCOUNT_EXISTS']}", style="bold green")
+            line2.append("  DISABLED ", style="grey50")
+            line2.append(f"{self.stats['ACCOUNT_DISABLED']}", style="bold yellow")
+            line2.append("  MULTI ", style="grey50")
+            line2.append(f"{self.stats['MULTIPLE_ACCOUNTS']}", style="bold cyan")
+            line2.append("  NO_ACC ", style="grey50")
+            line2.append(f"{self.stats['NO_ACCOUNT']}", style="bold red")
+        else:
+            # Narrow: two lines
+            line2 = Text()
+            line2.append("E:", style="grey50")
+            line2.append(f"{self.stats['ACCOUNT_EXISTS']}", style="bold green")
+            line2.append(" D:", style="grey50")
+            line2.append(f"{self.stats['ACCOUNT_DISABLED']}", style="bold yellow")
+            line2.append(" M:", style="grey50")
+            line2.append(f"{self.stats['MULTIPLE_ACCOUNTS']}", style="bold cyan")
+            line2.append(" N:", style="grey50")
+            line2.append(f"{self.stats['NO_ACCOUNT']}", style="bold red")
 
         content = Text.assemble(line1, "\n", line2)
-        return Panel(content,
-                     title="[bold white]⚡ Live Progress[/bold white]",
-                     subtitle=f"[grey50]{self.workers} workers[/grey50]",
-                     border_style="bright_blue",
-                     padding=(0, 1))
+        return Panel(
+            content,
+            title="[bold white]⚡ Live Progress[/bold white]",
+            subtitle=f"[grey50]{self.workers}W[/grey50]",
+            border_style="bright_blue",
+            padding=(0, 1),
+        )
 
     async def log(self, msg):
         async with self.lock:
@@ -362,53 +474,42 @@ class LiveUI:
 
 async def worker(wid, queue, queue_lock, records, records_lock,
                  pending, pending_lock, ui, total, t_start):
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=REQUEST_TIMEOUT,
-        limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
-    ) as client:
-        while True:
-            async with pending_lock:
-                if pending[0] <= 0:
-                    return
+    while True:
+        async with pending_lock:
+            if pending[0] <= 0:
+                return
 
-            async with queue_lock:
-                if queue:
-                    number, attempt = queue.popleft()
-                else:
-                    number = None
+        async with queue_lock:
+            if queue:
+                number, attempt = queue.popleft()
+            else:
+                number = None
 
-            if number is None:
-                await asyncio.sleep(0.05)
-                continue
+        if number is None:
+            await asyncio.sleep(0.05)
+            continue
 
-            try:
-                status = await check_number(client, number)
-            except Exception:
-                status = "ERROR"
+        # Use fresh client per check for consistency
+        try:
+            status = await check_number_with_retry(number)
+        except Exception:
+            status = "ERROR"
 
-            # retry silently
-            if status == "ERROR" and attempt < MAX_ATTEMPTS:
-                async with queue_lock:
-                    queue.appendleft((number, attempt + 1))
-                await asyncio.sleep(0.5 * attempt)
-                continue
+        if status == "ERROR":
+            status = "NO_ACCOUNT"   # fallback
 
-            if status == "ERROR":
-                status = "NO_ACCOUNT"   # fallback
+        async with records_lock:
+            records.append((number, status))
+        async with pending_lock:
+            pending[0] -= 1
 
-            async with records_lock:
-                records.append((number, status))
-            async with pending_lock:
-                pending[0] -= 1
+        done = total - pending[0]
+        rate = done / max(time.time() - t_start, 0.01)
+        await ui.log(f"[{done:>4}/{total}] W{wid} "
+                     f"{number:<17} → {status:<18} ({rate:5.2f}/s)")
+        await ui.record(status)
 
-            done = total - pending[0]
-            rate = done / max(time.time() - t_start, 0.01)
-            await ui.log(f"[{done:>4}/{total}] W{wid} "
-                         f"{number:<17} → {status:<18} ({rate:5.2f}/s)")
-            await ui.record(status)
-
-            await asyncio.sleep(PAUSE_BETWEEN)
+        await asyncio.sleep(PAUSE_BETWEEN + random.uniform(0, 0.1))
 
 
 # ===================== MAIN =====================
@@ -496,20 +597,29 @@ async def main_async(numbers_path, numbers, workers):
 
 
 def main():
-    numbers_path = ask_numbers_path()
+    print("=" * 60)
+    print("  Facebook Number Checker — Termux / HTTP mode")
+    print("=" * 60)
 
-    if not os.path.exists(numbers_path):
-        print(f"[!] Path does not exist: {numbers_path}")
+    # ---- Auto-detect numbers.txt ----
+    numbers_path = find_numbers_file()
+
+    if numbers_path is None:
+        # Not found anywhere -> create in cwd
+        numbers_path = os.path.abspath(NUMBERS_FILENAME)
+        create_sample(numbers_path)
         return
+
+    print(f"[+] Auto-detected: {numbers_path}")
 
     numbers = read_numbers(numbers_path)
     if not numbers:
+        print("[!] File is empty. Add numbers and re-run.")
         return
 
     workers = detect_workers()
-    env_note = " (override with FB_WORKERS)" if "FB_WORKERS" not in os.environ else ""
-    print(f"[+] Loaded {len(numbers)} numbers from: {numbers_path}")
-    print(f"[+] Workers: {workers}{env_note}")
+    print(f"[+] Loaded {len(numbers)} unique numbers")
+    print(f"[+] Workers: {workers}")
     print()
 
     try:
