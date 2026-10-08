@@ -177,18 +177,35 @@ def extract_form_data(html: str):
 
 
 def classify_response(html: str) -> str:
-    """Return one of: ACCOUNT_DISABLED / MULTIPLE_ACCOUNTS / NO_ACCOUNT / ACCOUNT_EXISTS / ERROR."""
+    """
+    Return one of:
+    ACCOUNT_DISABLED / MULTIPLE_ACCOUNTS / NO_ACCOUNT / ACCOUNT_EXISTS / ERROR
+
+    Uses comprehensive checks on the response HTML for maximum accuracy.
+    """
     t = html.lower()
 
-    # 1. Disabled
+    # ---- 1. ACCOUNT DISABLED ----
     if "account has been disabled" in t or "your account has been disabled" in t:
         return "ACCOUNT_DISABLED"
 
-    # 2. Multiple accounts
+    # ---- 2. MULTIPLE ACCOUNTS ----
+    # "Choose your account" heading
     if "choose your account" in t:
         return "MULTIPLE_ACCOUNTS"
+    # Mobile form structure: form#login_form with action containing identifier=
+    soup = BeautifulSoup(html, "html.parser")
+    login_form = soup.find("form", id="login_form")
+    if login_form:
+        action = login_form.get("action", "") or ""
+        if "identifier=" in action:
+            return "MULTIPLE_ACCOUNTS"
+    # Also detect account selection links inside data-sigil="marea"
+    for area in soup.find_all(attrs={"data-sigil": "marea"}):
+        if area.find("a", class_="touchable"):
+            return "MULTIPLE_ACCOUNTS"
 
-    # 3. No account
+    # ---- 3. NO ACCOUNT ----
     if "login_identify_search_error_msg" in t:
         return "NO_ACCOUNT"
     if "doesn't match an account" in t or "does not match an account" in t:
@@ -196,7 +213,7 @@ def classify_response(html: str) -> str:
     if "no account found" in t:
         return "NO_ACCOUNT"
 
-    # 4. Exists — forwarded page
+    # ---- 4. ACCOUNT EXISTS ----
     if 'type="password"' in t:
         return "ACCOUNT_EXISTS"
     if "try entering your password" in t:
@@ -206,11 +223,12 @@ def classify_response(html: str) -> str:
     if "enter the code" in t:
         return "ACCOUNT_EXISTS"
 
-    # Identify form gone => forwarded
+    # If the identify form is gone (no more input) -> forwarded = exists
     if 'id="identify_search_text_input"' not in t and 'name="email"' not in t:
         return "ACCOUNT_EXISTS"
 
-    # Fallback: no error element present => assume exists
+    # ---- Fallback ----
+    # No error element and still on the form -> account exists (user rule)
     return "ACCOUNT_EXISTS"
 
 
